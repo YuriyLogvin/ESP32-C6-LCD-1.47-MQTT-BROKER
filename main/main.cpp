@@ -18,7 +18,6 @@
 #include "NvsSettingsAccessor.h"
 
 #include "esp_console.h"
-//#include "esp_console_cmd.h"
 #include "esp_system.h"
 
 static const char *TAG = "MAIN";
@@ -118,6 +117,16 @@ void _LoadSettings()
 int OnSetSSID(int argc, char **argv)
 {
     if (argc < 3) {
+
+        NvsSettingsAccessor::Init4Read();        
+
+        auto ssId = NvsSettingsAccessor::GetSsId();
+        auto mode = NvsSettingsAccessor::GetConnectionMode();
+
+        NvsSettingsAccessor::DeInit();
+
+        printf("SSID=%s; MODE=%d\n", ssId != NULL ? ssId : DEFAULT_WIFI_SSID, mode == NvsSettingsAccessor::ConnectionModes::Client ? 1 : 0);
+
         printf("Usage: SSID <SSID> <SSID PWD> <MODE>\n");
         printf("\t<MODE>: 0-AP(default), 1-Client\n");
         return 1;
@@ -132,7 +141,7 @@ int OnSetSSID(int argc, char **argv)
         if (modeInt == 1)
             mode = NvsSettingsAccessor::ConnectionModes::Client;
     }   
-    printf("Setting SSID to: %s\n", ssid);
+    printf("Setting SSID to '%s' mode %d\n", ssid, mode == NvsSettingsAccessor::ConnectionModes::Client ? 1 : 0);
 
     NvsSettingsAccessor::Init4Write();        
 
