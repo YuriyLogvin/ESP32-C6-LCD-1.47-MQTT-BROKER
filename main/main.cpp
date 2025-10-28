@@ -15,11 +15,16 @@
 #include "PicoMQTT.h"
 
 #include "SpiMipiLvglDisplayDriver.h"
+#include "NvsSettingsAccessor.h"
+
+#include "esp_console.h"
+//#include "esp_console_cmd.h"
+#include "esp_system.h"
 
 static const char *TAG = "MAIN";
 
-#define SSID_NAME       "TestWiFi"
-#define SSID_PASSWORD   "12345678"
+#define DEFAULT_WIFI_SSID       "TestWiFi"
+#define DEFAULT_WIFI_PWD        "12345678"
 
 #define ELMB_LCD_HOST  SPI2_HOST
 #define ELMB_LCD_PIXEL_CLOCK_HZ     (12 * 1000 * 1000)
@@ -30,6 +35,147 @@ static const char *TAG = "MAIN";
 #define ELMB_PIN_NUM_LCD_DC         GPIO_NUM_15
 #define ELMB_PIN_NUM_LCD_RST        GPIO_NUM_21
 #define ELMB_PIN_NUM_BK_LIGHT       GPIO_NUM_22
+
+
+void _CreateConsoleCommands();
+void _SpiInit();    
+void _StartMqttBrocker();
+void _StartWiFi();
+void _CreateUI();
+void _LoadSettings();
+
+PicoMQTT::Server _Mqtt;
+
+const char* _SsIdName = DEFAULT_WIFI_SSID;
+const char* _SsIdPwd = DEFAULT_WIFI_PWD;
+NvsSettingsAccessor::ConnectionModes _SsIdMode = NvsSettingsAccessor::ConnectionModes::AP;
+
+extern "C" void app_main()
+{
+    ESP_LOGI(TAG, "->main");
+
+    _LoadSettings(); 
+
+    //Init SPI common driver for LVGL and SD card if used
+    _SpiInit();
+
+    //Init LVGL for common SPI driver
+    SpiMipiLvglDisplayDriver spiDisplayDriver(ELMB_LCD_HOST, ELMB_PIN_NUM_LCD_CS, ELMB_PIN_NUM_LCD_DC, ELMB_PIN_NUM_LCD_RST, ELMB_LCD_PIXEL_CLOCK_HZ, ELMB_PIN_NUM_BK_LIGHT);
+
+    _StartWiFi();    
+
+    //Initialize MQTT broker
+    _StartMqttBrocker();    
+
+    //Create a label on the screen and link them to mqtt topics
+    _CreateUI();
+
+    // Create console commands for configuring WiFi  
+    _CreateConsoleCommands();
+
+    int i = 0;
+
+    ESP_LOGI(TAG, "->while");
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1));
+
+        lv_timer_handler();
+        _Mqtt.loop();
+
+        //if (random(1000) == 0)
+        //    _Mqtt.publish("picomqtt/welcome", "Hello from PicoMQTT!");
+
+        /*if (++i % 50 == 0) 
+        {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%d%%", i/50);
+            lv_label_set_text(label, buf);
+            lv_obj_center(label);
+           // ESP_LOGI(TAG, "Running lv_timer_handler... %d", i/50);
+        }*/
+    }
+
+
+}
+
+void _LoadSettings()
+{
+    _SsIdMode = NvsSettingsAccessor::ConnectionModes::AP;
+    NvsSettingsAccessor::Init4Read();        
+    _SsIdName = NvsSettingsAccessor::GetSsId();
+    if (_SsIdName == NULL)
+    {
+        _SsIdName = DEFAULT_WIFI_SSID;
+    }
+    else
+    {
+        _SsIdPwd = NvsSettingsAccessor::GetPwd();
+        _SsIdMode = NvsSettingsAccessor::GetConnectionMode();
+    }
+    NvsSettingsAccessor::DeInit();
+}
+
+int OnSetSSID(int argc, char **argv)
+{
+    if (argc < 3) {
+        printf("Usage: SSID <SSID> <SSID PWD> <MODE>\n");
+        printf("\t<MODE>: 0-AP(default), 1-Client\n");
+        return 1;
+    }
+
+    const char *ssid = argv[1];
+    const char *ssidPwd = argv[2];
+    NvsSettingsAccessor::ConnectionModes mode = NvsSettingsAccessor::ConnectionModes::AP;
+    if (argc > 3)
+    {
+        int modeInt = atoi(argv[3]);
+        if (modeInt == 1)
+            mode = NvsSettingsAccessor::ConnectionModes::Client;
+    }   
+    printf("Setting SSID to: %s\n", ssid);
+
+    NvsSettingsAccessor::Init4Write();        
+
+    NvsSettingsAccessor::SetSsId(ssid);
+    NvsSettingsAccessor::SetPwd(ssidPwd);
+    NvsSettingsAccessor::SetConnectionMode(mode);
+
+    NvsSettingsAccessor::DeInit();
+
+    printf("Restart device for apply changes\n");
+
+    return 0;
+}
+
+void _CreateConsoleCommands()
+{
+    esp_console_repl_t *repl = NULL;
+    esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
+    /* Prompt to be printed before each line.
+     * This can be customized, made dynamic, etc.
+     */
+    repl_config.prompt = "config>";
+    repl_config.max_cmdline_length = 256;
+
+    static esp_console_cmd_t cmd = {
+        .command = "SSID",
+        .help = "Set WiFi SSID and Password",
+        .hint = NULL,
+        .func = OnSetSSID,
+        .argtable = NULL
+    };
+
+    /* Register commands */
+    esp_console_register_help_command();
+    esp_console_cmd_register(&cmd);
+    //register_system_common();
+
+    esp_console_dev_usb_serial_jtag_config_t hw_config = ESP_CONSOLE_DEV_USB_SERIAL_JTAG_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_console_new_repl_usb_serial_jtag(&hw_config, &repl_config, &repl));
+
+    ESP_ERROR_CHECK(esp_console_start_repl(repl));
+
+}
 
 void _SpiInit()
 {
@@ -52,18 +198,30 @@ void _SpiInit()
     }
 }
 
-PicoMQTT::Server _Mqtt;
+void _StartWiFi()
+{
+    ESP_LOGI(TAG, "Starting Wifi with SSID '%s'...", _SsIdName);
+    switch (_SsIdMode)
+    {
+        case NvsSettingsAccessor::ConnectionModes::Client:
+            ESP_LOGI(TAG, "\tSTA Mode");
+            WiFi.mode(WIFI_STA);
+            break;
+        case NvsSettingsAccessor::ConnectionModes::AP:
+        default:
+            ESP_LOGI(TAG, "\AP Mode");
+            WiFi.mode(WIFI_AP);
+            break;
+    }
+
+    auto res = WiFi.begin(_SsIdName, _SsIdPwd);
+    ESP_LOGI(TAG, "Started %d...", res);
+
+}
 
 void _StartMqttBrocker()
 {
     ESP_LOGI(TAG, "Starting MQTT broker...");
-
-    nvs_flash_init();
-
-    WiFi.mode(WIFI_STA);
-
-    WiFi.begin(SSID_NAME, SSID_PASSWORD);
-
 
     _Mqtt.keep_alive_tolerance_millis = 20000;
     _Mqtt.socket_timeout_millis = 15000;
@@ -232,47 +390,5 @@ void _CreateUI()
                 }
             }
         });            
-
-}
-
-extern "C" void app_main()
-{
-    ESP_LOGI(TAG, "->main");
-
-    //Init SPI common driver for LVGL and SD card if used
-    _SpiInit();
-
-    //Init LVGL for common SPI driver
-    SpiMipiLvglDisplayDriver spiDisplayDriver(ELMB_LCD_HOST, ELMB_PIN_NUM_LCD_CS, ELMB_PIN_NUM_LCD_DC, ELMB_PIN_NUM_LCD_RST, ELMB_LCD_PIXEL_CLOCK_HZ, ELMB_PIN_NUM_BK_LIGHT);
-
-    //Initialize MQTT broker
-    _StartMqttBrocker();    
-
-    //Create a label on the screen and link them to mqtt topics
-    _CreateUI();
-
-
-    int i = 0;
-
-    ESP_LOGI(TAG, "->while");
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1));
-
-        lv_timer_handler();
-        _Mqtt.loop();
-
-        //if (random(1000) == 0)
-        //    _Mqtt.publish("picomqtt/welcome", "Hello from PicoMQTT!");
-
-        /*if (++i % 50 == 0) 
-        {
-            char buf[32];
-            snprintf(buf, sizeof(buf), "%d%%", i/50);
-            lv_label_set_text(label, buf);
-            lv_obj_center(label);
-           // ESP_LOGI(TAG, "Running lv_timer_handler... %d", i/50);
-        }*/
-    }
-
 
 }
